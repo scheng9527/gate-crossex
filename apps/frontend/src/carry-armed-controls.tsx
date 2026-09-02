@@ -109,8 +109,8 @@ export function CarryArmedControls(props: CarryArmedControlsProps) {
   const recent = active ?? pairEntries[0] ?? null;
   const shortVenue = venueFromSymbol(props.shortSymbol);
   const longVenue = venueFromSymbol(props.longSymbol);
-  const shortTakerFee = numericFutureFeeRate(fees, shortVenue, props.shortSymbol, 'taker');
-  const longTakerFee = numericFutureFeeRate(fees, longVenue, props.longSymbol, 'taker');
+  const shortTakerFee = numericFutureFeeRate(fees, shortVenue, props.shortSymbol, 'taker') ?? null;
+  const longTakerFee = numericFutureFeeRate(fees, longVenue, props.longSymbol, 'taker') ?? null;
 
   const entry = finiteText(entryBps);
   const edge = finiteText(minFundingEdge);
@@ -137,8 +137,8 @@ export function CarryArmedControls(props: CarryArmedControlsProps) {
     return {
       kind: 'position',
       asset: props.asset,
-      leftVenue: shortVenue.toUpperCase() as StrategyConfig['leftVenue'],
-      rightVenue: longVenue.toUpperCase() as StrategyConfig['rightVenue'],
+      leftVenue: shortVenue.toUpperCase(),
+      rightVenue: longVenue.toUpperCase(),
       leftSide: 'SELL',
       rightSide: 'BUY',
       entryBps,
