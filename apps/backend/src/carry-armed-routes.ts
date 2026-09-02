@@ -33,7 +33,7 @@ const IdSchema = z.object({ id: z.string().regex(/^CARRY-[A-Z0-9]{10}$/) });
 export function registerCarryArmedRoutes(
   app: FastifyInstance,
   service: CarryArmedService,
-  activeAccount: () => { profileId: string; label: string } | null,
+  activeAccount: () => Promise<{ profileId: string; label: string } | null>,
 ): void {
   app.get('/api/carry/armed', {
     config: { rateLimit: { max: 60, timeWindow: '1 minute' } },
@@ -59,7 +59,7 @@ export function registerCarryArmedRoutes(
         issues: parsed.error.issues.map((issue) => ({ path: issue.path.join('.'), message: issue.message })),
       });
     }
-    const account = activeAccount();
+    const account = await activeAccount();
     if (!account) return reply.code(409).send({ error: 'credential_not_configured' });
     try {
       return service.arm({
@@ -91,7 +91,7 @@ export function registerCarryArmedRoutes(
   }, async (request, reply) => {
     const parsed = IdSchema.safeParse(request.params);
     if (!parsed.success) return reply.code(400).send({ error: 'invalid_carry_armed_id' });
-    const account = activeAccount();
+    const account = await activeAccount();
     if (!account) return reply.code(409).send({ error: 'credential_not_configured' });
     try {
       return service.cancel(parsed.data.id, account.profileId);
