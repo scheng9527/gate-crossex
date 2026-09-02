@@ -4,6 +4,8 @@ import { createSystemCredentialVault } from './credential-vault.js';
 import { GateCrossExClient } from './crossex-client.js';
 import { VenuePublicMarketDataClient } from '@gate-crossex/public-data';
 import { openDatabase, prepareDatabaseForClose } from './database.js';
+import { FundingObservationStore } from './funding-observations.js';
+import { CrossExMarketHub } from './market-hub.js';
 import { acquireBackendProcessLock } from './process-lock.js';
 import { readHyperliquidPerpMetadata, writeHyperliquidPerpMetadata } from './repositories.js';
 import { monitorWindowsServiceParent } from './service-parent-monitor.js';
@@ -18,6 +20,14 @@ try {
   processLock.release();
   throw error;
 }
+
+const marketHub = new CrossExMarketHub(config.gatePublicWebSocketUrl);
+const fundingObservations = new FundingObservationStore(database);
+const unsubscribeFundingObservations = marketHub.subscribe((message) => {
+  if (message.type !== 'market.update') return;
+  fundingObservations.observeMarket(message.payload);
+});
+
 let app: Awaited<ReturnType<typeof buildApp>>;
 try {
   const credentialVault = await createSystemCredentialVault(config.credentialEnvPath, {
@@ -34,9 +44,11 @@ try {
         write: (snapshot) => writeHyperliquidPerpMetadata(database, snapshot),
       },
     }),
+    marketHub,
     startMarketStream: true,
   });
 } catch (error) {
+  unsubscribeFundingObservations();
   database.close();
   processLock.release();
   throw error;
@@ -49,6 +61,7 @@ async function shutdown(signal: string): Promise<void> {
   app.log.info({ signal }, 'shutting down local backend');
   try {
     await app.close();
+    unsubscribeFundingObservations();
     prepareDatabaseForClose(database);
     database.close();
   } catch (error) {
@@ -88,6 +101,7 @@ try {
 } catch (error) {
   app.log.error(error, 'failed to start local backend');
   await app.close().catch((closeError) => app.log.error(closeError, 'startup cleanup failed'));
+  unsubscribeFundingObservations();
   prepareDatabaseForClose(database);
   database.close();
   processLock.release();
