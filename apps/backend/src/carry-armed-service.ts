@@ -52,12 +52,20 @@ interface CarryArmedRow {
   cancelled_at: string | null;
 }
 
+interface GateSnapshot {
+  passed: boolean;
+  reason: string;
+  metrics: CarryEntryGateMetrics | null;
+}
+
 export interface CarryArmedServiceOptions {
   market(symbol: string): LiveMarket | null;
   connectionState?(): 'connecting' | 'healthy' | 'reconnecting' | 'stale' | 'disconnected';
   liveTradingEnabled(): boolean;
   activeCredentialProfile(): Promise<{ profileId: string; label: string } | null>;
   startStrategy(strategy: CreateStrategyInput): Promise<StrategyRecord>;
+  strategyState(strategyId: string): Promise<{ status: string; progress: number } | null>;
+  stopStrategy(strategyId: string): Promise<void>;
   tickIntervalMs?: number;
   marketFreshnessMs?: number;
   now?: () => number;
@@ -113,9 +121,10 @@ function rowToEntry(row: CarryArmedRow): CarryArmedEntry {
  * Persistent user-authorized carry entry watch.
  *
  * ARMED is separate from execution_strategies. Only after every carry condition passes does this
- * service cross the application's existing strategy-start boundary. Two-leg execution, partial
- * fill repair, margin/leverage checks, credential serialization and shutdown quiescence therefore
- * remain owned by the existing execution stack.
+ * service cross the application's existing strategy-start boundary. While that execution strategy
+ * is still building its position, this service keeps the Carry Gate live. If conditions disappear
+ * before any fill, the execution strategy is stopped and the intent returns to ARMED. If exposure
+ * already exists, further entry is stopped and the intent becomes ERROR for manual review.
  */
 export class CarryArmedService {
   private readonly tickIntervalMs: number;
@@ -130,7 +139,7 @@ export class CarryArmedService {
     private readonly database: Database.Database,
     private readonly options: CarryArmedServiceOptions,
   ) {
-    this.tickIntervalMs = options.tickIntervalMs ?? 1_000;
+    this.tickIntervalMs = options.tickIntervalMs ?? 500;
     this.marketFreshnessMs = options.marketFreshnessMs ?? 15_000;
     this.now = options.now ?? Date.now;
     // A crash during TRIGGERING is ambiguous: the execution strategy might already exist. Never
@@ -158,7 +167,7 @@ export class CarryArmedService {
   list(): CarryArmedEntry[] {
     return (this.database.prepare(`
       SELECT * FROM carry_armed_entries
-      ORDER BY CASE status WHEN 'ARMED' THEN 0 WHEN 'TRIGGERING' THEN 1 ELSE 2 END,
+      ORDER BY CASE status WHEN 'ARMED' THEN 0 WHEN 'TRIGGERING' THEN 1 WHEN 'TRIGGERED' THEN 2 ELSE 3 END,
                updated_at DESC
       LIMIT 200
     `).all() as CarryArmedRow[]).map(rowToEntry);
@@ -189,12 +198,12 @@ export class CarryArmedService {
       throw new TradingRuntimeError('carry_arm_symbol_direction_mismatch', 400);
     }
     if (!input.gate.enabled) throw new TradingRuntimeError('carry_gate_disabled', 400);
-    const countRow = this.database.prepare(`SELECT COUNT(*) AS count FROM carry_armed_entries WHERE status = 'ARMED'`)
+    const countRow = this.database.prepare(`SELECT COUNT(*) AS count FROM carry_armed_entries WHERE status IN ('ARMED', 'TRIGGERING', 'TRIGGERED')`)
       .get() as { count: number };
     if (countRow.count >= 20) throw new TradingRuntimeError('too_many_armed_carry_entries', 409);
     const duplicate = this.database.prepare(`
       SELECT id FROM carry_armed_entries
-      WHERE status IN ('ARMED', 'TRIGGERING')
+      WHERE status IN ('ARMED', 'TRIGGERING', 'TRIGGERED')
         AND credential_profile_id = ? AND short_symbol = ? AND long_symbol = ?
       LIMIT 1
     `).get(input.account.profileId, input.shortSymbol, input.longSymbol) as { id: string } | undefined;
@@ -253,15 +262,17 @@ export class CarryArmedService {
 
   private async tickOnce(): Promise<void> {
     const rows = this.database.prepare(`
-      SELECT * FROM carry_armed_entries WHERE status = 'ARMED' ORDER BY created_at ASC LIMIT 20
+      SELECT * FROM carry_armed_entries
+      WHERE status IN ('ARMED', 'TRIGGERED')
+      ORDER BY created_at ASC LIMIT 40
     `).all() as CarryArmedRow[];
     for (const row of rows) {
       const entry = rowToEntry(row);
       try {
-        await this.evaluate(entry);
+        if (entry.status === 'ARMED') await this.evaluateArmed(entry);
+        else await this.monitorTriggered(entry);
       } catch {
         this.recordDecision(entry.id, 'carry_gate_internal_error', null, true);
-        // A bad evaluator/API state must not turn into a tight loop against the live execution edge.
         this.retryAfter.set(entry.id, this.now() + 30_000);
       }
     }
@@ -281,36 +292,18 @@ export class CarryArmedService {
     return market;
   }
 
-  private async evaluate(entry: CarryArmedEntry): Promise<void> {
-    if ((this.retryAfter.get(entry.id) ?? 0) > this.now()) return;
-    if (!this.options.liveTradingEnabled()) {
-      this.recordDecision(entry.id, 'live_trading_locked', null);
-      return;
-    }
-    const activeAccount = await this.options.activeCredentialProfile();
-    if (!activeAccount || activeAccount.profileId !== entry.credentialProfileId) {
-      this.recordDecision(entry.id, 'account_not_active', null);
-      return;
-    }
+  private gateSnapshot(entry: CarryArmedEntry): GateSnapshot {
     const shortMarket = this.freshMarket(entry.shortSymbol);
     const longMarket = this.freshMarket(entry.longSymbol);
-    if (!shortMarket || !longMarket) {
-      this.recordDecision(entry.id, 'market_data_unavailable_or_stale', null);
-      return;
-    }
+    if (!shortMarket || !longMarket) return { passed: false, reason: 'market_data_unavailable_or_stale', metrics: null };
     const shortBid = new Decimal(shortMarket.bidPrice);
     const longAsk = new Decimal(longMarket.askPrice);
-    if (!shortBid.gt(0) || !longAsk.gt(0)) {
-      this.recordDecision(entry.id, 'market_data_unavailable_or_stale', null);
-      return;
-    }
+    if (!shortBid.gt(0) || !longAsk.gt(0)) return { passed: false, reason: 'market_data_unavailable_or_stale', metrics: null };
     const basisBps = shortBid.minus(longAsk).div(longAsk).mul(10_000).toNumber();
     const entryThreshold = Number(entry.strategy.entryBps ?? '0');
     if (!Number.isFinite(entryThreshold) || basisBps < entryThreshold) {
-      this.recordDecision(entry.id, 'basis_below_entry_threshold', null);
-      return;
+      return { passed: false, reason: 'basis_below_entry_threshold', metrics: null };
     }
-
     const decision = evaluateCarryEntryGate({
       database: this.database,
       config: entry.gate,
@@ -319,22 +312,38 @@ export class CarryArmedService {
       executableBasisBps: basisBps,
       nowMs: this.now(),
     });
-    this.recordDecision(entry.id, decision.reason, decision.metrics);
-    if (!decision.passed) return;
+    return { passed: decision.passed, reason: decision.reason, metrics: decision.metrics };
+  }
+
+  private async accountMatches(entry: CarryArmedEntry): Promise<boolean> {
+    const active = await this.options.activeCredentialProfile();
+    return active !== null && active.profileId === entry.credentialProfileId;
+  }
+
+  private async evaluateArmed(entry: CarryArmedEntry): Promise<void> {
+    if ((this.retryAfter.get(entry.id) ?? 0) > this.now()) return;
+    if (!this.options.liveTradingEnabled()) {
+      this.recordDecision(entry.id, 'live_trading_locked', null);
+      return;
+    }
+    if (!(await this.accountMatches(entry))) {
+      this.recordDecision(entry.id, 'account_not_active', null);
+      return;
+    }
+    const snapshot = this.gateSnapshot(entry);
+    this.recordDecision(entry.id, snapshot.reason, snapshot.metrics);
+    if (!snapshot.passed) return;
 
     const claimedAt = new Date(this.now()).toISOString();
     const claimed = this.database.prepare(`
       UPDATE carry_armed_entries
       SET status = 'TRIGGERING', last_gate_reason = 'passed', last_gate_metrics_json = ?, updated_at = ?
       WHERE id = ? AND status = 'ARMED'
-    `).run(JSON.stringify(decision.metrics), claimedAt, entry.id);
+    `).run(snapshot.metrics ? JSON.stringify(snapshot.metrics) : null, claimedAt, entry.id);
     if (claimed.changes !== 1) return;
 
     try {
-      // Re-read the account after the atomic claim. A credential switch between the gate decision
-      // and the strategy-start boundary must not move this authorization to a different account.
-      const stillActive = await this.options.activeCredentialProfile();
-      if (!stillActive || stillActive.profileId !== entry.credentialProfileId) {
+      if (!(await this.accountMatches(entry))) {
         const now = new Date(this.now()).toISOString();
         this.database.prepare(`
           UPDATE carry_armed_entries SET status = 'ARMED', last_gate_reason = 'account_not_active', updated_at = ?
@@ -370,6 +379,78 @@ export class CarryArmedService {
     }
   }
 
+  private async monitorTriggered(entry: CarryArmedEntry): Promise<void> {
+    if (!entry.triggeredStrategyId || (this.retryAfter.get(entry.id) ?? 0) > this.now()) return;
+    const strategy = await this.options.strategyState(entry.triggeredStrategyId);
+    if (!strategy) {
+      this.markError(entry.id, 'triggered_strategy_missing');
+      return;
+    }
+    if (strategy.status === 'COMPLETED') return;
+    if (strategy.status === 'STOPPED') {
+      const now = new Date(this.now()).toISOString();
+      this.database.prepare(`
+        UPDATE carry_armed_entries SET status = 'CANCELLED', cancelled_at = ?, updated_at = ?
+        WHERE id = ? AND status = 'TRIGGERED'
+      `).run(now, now, entry.id);
+      return;
+    }
+    if (strategy.status === 'PAUSED' || strategy.status === 'PAUSE_PENDING_REMOTE' || strategy.status === 'STOP_PENDING_REMOTE') {
+      this.markError(entry.id, `execution_strategy_${strategy.status.toLowerCase()}`);
+      return;
+    }
+
+    let snapshot: GateSnapshot;
+    if (!this.options.liveTradingEnabled()) snapshot = { passed: false, reason: 'live_trading_locked', metrics: null };
+    else if (!(await this.accountMatches(entry))) snapshot = { passed: false, reason: 'account_not_active', metrics: null };
+    else snapshot = this.gateSnapshot(entry);
+    this.recordDecision(entry.id, snapshot.reason, snapshot.metrics);
+    if (snapshot.passed) return;
+
+    try {
+      await this.options.stopStrategy(entry.triggeredStrategyId);
+    } catch {
+      this.recordDecision(entry.id, `stop_retry:${snapshot.reason}`, snapshot.metrics, true);
+      this.retryAfter.set(entry.id, this.now() + 3_000);
+      return;
+    }
+
+    const now = new Date(this.now()).toISOString();
+    if (!(strategy.progress > 0)) {
+      // No matched exposure exists: return to the exact persisted authorization and wait again.
+      this.database.prepare(`
+        UPDATE carry_armed_entries
+        SET status = 'ARMED', triggered_strategy_id = NULL, triggered_at = NULL,
+            last_gate_reason = ?, last_gate_metrics_json = ?, error_reason = NULL, updated_at = ?
+        WHERE id = ? AND status = 'TRIGGERED'
+      `).run(`rearmed:${snapshot.reason}`, snapshot.metrics ? JSON.stringify(snapshot.metrics) : null, now, entry.id);
+      this.retryAfter.set(entry.id, this.now() + 1_000);
+      return;
+    }
+
+    // Some hedged exposure already exists. The execution strategy is stopped so it cannot add more;
+    // do not silently re-arm because that would authorize a second position on top of the first.
+    this.database.prepare(`
+      UPDATE carry_armed_entries
+      SET status = 'ERROR', error_reason = ?, last_gate_reason = ?, last_gate_metrics_json = ?, updated_at = ?
+      WHERE id = ? AND status = 'TRIGGERED'
+    `).run(
+      `gate_lost_after_partial_entry_review_required:${snapshot.reason}`,
+      snapshot.reason,
+      snapshot.metrics ? JSON.stringify(snapshot.metrics) : null,
+      now,
+      entry.id,
+    );
+  }
+
+  private markError(id: string, reason: string): void {
+    const now = new Date(this.now()).toISOString();
+    this.database.prepare(`
+      UPDATE carry_armed_entries SET status = 'ERROR', error_reason = ?, updated_at = ?
+      WHERE id = ? AND status IN ('ARMED', 'TRIGGERED')
+    `).run(reason, now, id);
+  }
+
   private recordDecision(
     id: string,
     reason: string,
@@ -377,18 +458,18 @@ export class CarryArmedService {
     force = false,
   ): void {
     const current = this.database.prepare(`
-      SELECT last_gate_reason FROM carry_armed_entries WHERE id = ? AND status = 'ARMED'
+      SELECT last_gate_reason FROM carry_armed_entries
+      WHERE id = ? AND status IN ('ARMED', 'TRIGGERED')
     `).get(id) as { last_gate_reason: string | null } | undefined;
     if (!current) return;
     const nowMs = this.now();
     const lastWriteAt = this.lastDecisionWriteAt.get(id) ?? 0;
-    // State changes are durable immediately. A stable waiting state writes at most every 30s.
     if (!force && current.last_gate_reason === reason && nowMs - lastWriteAt < 30_000) return;
     const now = new Date(nowMs).toISOString();
     this.database.prepare(`
       UPDATE carry_armed_entries
       SET last_gate_reason = ?, last_gate_metrics_json = ?, updated_at = ?
-      WHERE id = ? AND status = 'ARMED'
+      WHERE id = ? AND status IN ('ARMED', 'TRIGGERED')
     `).run(reason, metrics ? JSON.stringify(metrics) : null, now, id);
     this.lastDecisionWriteAt.set(id, nowMs);
   }
