@@ -50,9 +50,13 @@ function reasonText(reason: string | null, zh: boolean): string {
     open_interest_below_minimum: ['单腿 OI 低于阈值', 'Open interest below minimum'],
     funding_window_too_close: ['距离 Funding 结算过近', 'Too close to funding settlement'],
     passed: ['全部条件通过，正在进入实盘执行边界', 'All conditions passed; entering live execution boundary'],
+    execution_completed: ['授权仓位已完成', 'Authorized position completed'],
+    manual_cancelled: ['已手动取消继续开仓', 'Further entry cancelled manually'],
     carry_gate_internal_error: ['Carry Gate 内部检查失败', 'Carry gate internal check failed'],
   };
   if (reason.startsWith('start_retry:')) return zh ? `执行预检查暂未通过：${reason.slice(12)}` : `Execution preflight retry: ${reason.slice(12)}`;
+  if (reason.startsWith('rearmed:')) return zh ? `条件消失且未成交，已重新等待：${reason.slice(8)}` : `No fill; re-armed after: ${reason.slice(8)}`;
+  if (reason.startsWith('stop_retry:')) return zh ? `正在停止继续开仓：${reason.slice(11)}` : `Retrying execution stop: ${reason.slice(11)}`;
   const item = labels[reason];
   return item ? item[zh ? 0 : 1] : reason.replaceAll('_', ' ');
 }
@@ -105,7 +109,7 @@ export function CarryArmedControls(props: CarryArmedControlsProps) {
   const pairEntries = useMemo(() => entries.filter((entry) =>
     entry.shortSymbol === props.shortSymbol && entry.longSymbol === props.longSymbol),
   [entries, props.longSymbol, props.shortSymbol]);
-  const active = pairEntries.find((entry) => entry.status === 'ARMED' || entry.status === 'TRIGGERING') ?? null;
+  const active = pairEntries.find((entry) => ['ARMED', 'TRIGGERING', 'TRIGGERED'].includes(entry.status)) ?? null;
   const recent = active ?? pairEntries[0] ?? null;
   const shortVenue = venueFromSymbol(props.shortSymbol);
   const longVenue = venueFromSymbol(props.longSymbol);
@@ -197,7 +201,9 @@ export function CarryArmedControls(props: CarryArmedControlsProps) {
     try {
       const updated = await cancelCarryArmedEntry(active.id);
       setEntries((current) => current.map((entryItem) => entryItem.id === updated.id ? updated : entryItem));
-      setNotice(zh ? '已取消 Armed Entry' : 'Armed entry cancelled');
+      setNotice(active.status === 'TRIGGERED'
+        ? (zh ? '已停止继续开仓；已有成交仓位不会被自动平掉，请检查仓位。' : 'Further entry stopped. Existing fills are not auto-flattened; review positions.')
+        : (zh ? '已取消 Armed Entry' : 'Armed entry cancelled'));
     } catch (error) {
       setNotice(zh ? `取消失败：${error instanceof Error ? error.message : 'unknown error'}` : `Cancel failed: ${error instanceof Error ? error.message : 'unknown error'}`);
     } finally {
@@ -243,7 +249,7 @@ export function CarryArmedControls(props: CarryArmedControlsProps) {
         <div><dt>Cushion</dt><dd>{signedBps(metrics?.carryCushionBps8hProxy ?? null)}</dd></div>
         <div><dt>{zh ? 'Funding 状态' : 'Funding state'}</dt><dd>{metrics ? `${metrics.shortFundingState} / ${metrics.longFundingState}` : '—'}</dd></div>
       </dl>
-      {recent.triggeredStrategyId && <small>{zh ? '已交给实盘策略' : 'Execution strategy'}: {recent.triggeredStrategyId}</small>}
+      {recent.triggeredStrategyId && <small>{zh ? '关联实盘策略' : 'Execution strategy'}: {recent.triggeredStrategyId}</small>}
       {recent.errorReason && <small className="negative">{recent.errorReason}</small>}
     </div>}
 
@@ -251,9 +257,9 @@ export function CarryArmedControls(props: CarryArmedControlsProps) {
     {tradingMode !== 'live' && <p className="carry-armed-warning">{zh ? 'Live Trading 当前未启用。先在顶部切换到 Live，才能创建未来实盘授权。' : 'Live Trading is not enabled. Switch to Live before creating future execution authorization.'}</p>}
     <div className="carry-armed-actions">
       {active
-        ? <button type="button" className="carry-cancel-button" onClick={() => void cancel()} disabled={busy || active.status === 'TRIGGERING'}>{busy ? (zh ? '处理中…' : 'Working…') : zh ? '取消 Armed' : 'Cancel armed entry'}</button>
+        ? <button type="button" className="carry-cancel-button" onClick={() => void cancel()} disabled={busy || active.status === 'TRIGGERING'}>{busy ? (zh ? '处理中…' : 'Working…') : active.status === 'TRIGGERED' ? (zh ? '停止继续开仓' : 'Stop further entry') : (zh ? '取消 Armed' : 'Cancel armed entry')}</button>
         : <button type="button" className="carry-arm-button" onClick={() => void arm()} disabled={!armEnabled}>{busy ? (zh ? '提交中…' : 'Arming…') : zh ? 'ARM · 后台等待并自动开仓' : 'ARM · wait and enter automatically'}</button>}
-      <small>{zh ? 'ARM 是持久化的未来实盘授权，不是提醒。网页可以关闭；Backend 必须持续运行。锁定 Live Trading、切换账户或数据失效时不会触发。' : 'ARM is persistent future live-trading authorization, not an alert. The browser may close; the backend must stay running. Locked Live Trading, account mismatch, or stale data blocks execution.'}</small>
+      <small>{zh ? 'ARM 是持久化的未来实盘授权，不是提醒。网页可以关闭；Backend 必须持续运行。锁定 Live Trading、切换账户或数据失效时不会触发。触发后若已有成交，停止 Armed 只停止继续加仓，不会擅自平仓。' : 'ARM is persistent future live-trading authorization, not an alert. The browser may close; the backend must stay running. Locked Live Trading, account mismatch, or stale data blocks execution. After fills exist, stopping Armed prevents further entry but does not auto-flatten positions.'}</small>
     </div>
     {notice && <p className="carry-armed-notice">{notice}</p>}
   </section>;
