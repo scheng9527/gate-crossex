@@ -1,6 +1,6 @@
 import type { StrategyConfig } from './api.js';
 
-export type CarryArmedStatus = 'ARMED' | 'TRIGGERING' | 'TRIGGERED' | 'CANCELLED' | 'ERROR';
+export type CarryArmedStatus = 'ARMED' | 'TRIGGERING' | 'TRIGGERED' | 'COMPLETED' | 'CANCELLED' | 'ERROR';
 
 export interface CarryArmedGateConfig {
   enabled: true;
@@ -67,7 +67,7 @@ function isEntry(value: unknown): value is CarryArmedEntry {
   const item = value as Record<string, unknown>;
   return typeof item.id === 'string'
     && /^CARRY-[A-Z0-9]{10}$/.test(item.id)
-    && ['ARMED', 'TRIGGERING', 'TRIGGERED', 'CANCELLED', 'ERROR'].includes(String(item.status))
+    && ['ARMED', 'TRIGGERING', 'TRIGGERED', 'COMPLETED', 'CANCELLED', 'ERROR'].includes(String(item.status))
     && typeof item.asset === 'string'
     && typeof item.shortSymbol === 'string'
     && typeof item.longSymbol === 'string'
