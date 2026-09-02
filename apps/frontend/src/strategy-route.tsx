@@ -20,6 +20,7 @@ import {
   type VenueFeeRate,
 } from './api.js';
 import type { FundingChartSeries } from './charts.js';
+import { CarryResearchPanel } from './carry-research-panel.js';
 import { cumulativeFundingHistory, cumulativeFundingPnl, realizedFundingEdgeWindows } from './cumulative-funding-history.js';
 import { VenueSelect } from './venue-select.js';
 import { fundingPercentScaledTo8h } from './funding-rates.js';
@@ -479,7 +480,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
     leftHistorySymbol,
     rightHistorySymbol,
     priceDifferenceHistoryInterval,
-    mode === 'auto',
+    mode === 'auto' || mode === 'position',
   );
   const makerExchange = makerLeg === 'left' ? leftExchange : rightExchange;
   const configuredExecutionMethod = executionMethod === 'Maker–Taker' ? `${t('Maker–Taker')} · ${makerExchange.name} ${t('maker')}` : t('Taker–Taker');
@@ -487,11 +488,21 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
     { exchange: leftExchange, symbol: leftHistorySymbol, feeKind: executionMethod === 'Maker–Taker' && makerLeg === 'left' ? 'maker' : 'taker' },
     { exchange: rightExchange, symbol: rightHistorySymbol, feeKind: executionMethod === 'Maker–Taker' && makerLeg === 'right' ? 'maker' : 'taker' },
   ] as const;
+  const leftExecutionFeeRate = numericFutureFeeRate(fees, leftExchange.id, leftHistorySymbol, selectedFeeRows[0].feeKind);
+  const rightExecutionFeeRate = numericFutureFeeRate(fees, rightExchange.id, rightHistorySymbol, selectedFeeRows[1].feeKind);
   const leftLive = liveMarketFor(marketSnapshot, leftExchange.id, asset);
   const rightLive = liveMarketFor(marketSnapshot, rightExchange.id, asset);
   const overviewAsset = fundingOverview?.assets.find((entry) => entry.asset === asset);
   const leftOverview = overviewAsset?.venues.find((entry) => entry.venue === leftExchange.id.toUpperCase());
   const rightOverview = overviewAsset?.venues.find((entry) => entry.venue === rightExchange.id.toUpperCase());
+  const shortExchange = directionFlipped ? rightExchange : leftExchange;
+  const longExchange = directionFlipped ? leftExchange : rightExchange;
+  const shortHistorySymbol = directionFlipped ? rightHistorySymbol : leftHistorySymbol;
+  const longHistorySymbol = directionFlipped ? leftHistorySymbol : rightHistorySymbol;
+  const shortFundingIntervalHours = (directionFlipped ? rightOverview?.fundingIntervalHours : leftOverview?.fundingIntervalHours) ?? null;
+  const longFundingIntervalHours = (directionFlipped ? leftOverview?.fundingIntervalHours : rightOverview?.fundingIntervalHours) ?? null;
+  const shortExecutionFeeRate = directionFlipped ? rightExecutionFeeRate : leftExecutionFeeRate;
+  const longExecutionFeeRate = directionFlipped ? leftExecutionFeeRate : rightExecutionFeeRate;
   const leftTicker = marketSymbol(asset, quoteFor(leftExchange.id), 'perpetual');
   const rightTicker = marketSymbol(asset, quoteFor(rightExchange.id), 'perpetual');
   const leftStreamPrice = leftLive?.source === 'gate_crossex_websocket'
@@ -797,7 +808,6 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
     if (launching || !strategyInputsValid) return;
     setConfirmingLaunch(true);
   }
-
   const leftSide = directionFlipped ? 'Buy' : 'Sell';
   const rightSide = directionFlipped ? 'Sell' : 'Buy';
   const strategySetup = (
@@ -938,16 +948,32 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
             </div>
           </div>
         </article>}
-        {mode === 'auto' && <article className="premium-history-panel price-difference-history-panel terminal-panel">
+        {mode === 'position' && <CarryResearchPanel
+          language={language}
+          theme={theme}
+          asset={asset}
+          shortVenueName={shortExchange.name}
+          longVenueName={longExchange.name}
+          shortSymbol={shortHistorySymbol}
+          longSymbol={longHistorySymbol}
+          shortFundingIntervalHours={shortFundingIntervalHours}
+          longFundingIntervalHours={longFundingIntervalHours}
+          fundingEdgePercent8h={fundingEdge}
+          executableBasisBps={leftPrice > 0 && rightPrice > 0 ? priceDiffBps : null}
+          basisHistoryBps={priceDifferencePoints.map((point) => point.value)}
+          shortExecutionFeeRate={shortExecutionFeeRate}
+          longExecutionFeeRate={longExecutionFeeRate}
+        />}
+        {(mode === 'auto' || mode === 'position') && <article className="premium-history-panel price-difference-history-panel terminal-panel">
           <header className="premium-history-head">
             <div>
-              <p className="eyebrow">{t('Historical price difference')}</p>
+              <p className="eyebrow">{mode === 'position' ? (language === 'zh' ? '历史 Basis' : 'Historical basis') : t('Historical price difference')}</p>
               <h2>{leftExchange.name} {asset} <span>vs</span> {rightExchange.name} {asset}</h2>
-              <small>{t('Selected venue pair')}</small>
+              <small>{mode === 'position' ? (language === 'zh' ? 'Kline 收盘价差分布参考' : 'Candle-close spread distribution proxy') : t('Selected venue pair')}</small>
             </div>
             <div className="premium-history-controls">
               <span className="premium-live-badge"><i /> {t('Live pair')}</span>
-              <div role="group" aria-label={t('Historical price difference')}>
+              <div role="group" aria-label={mode === 'position' ? (language === 'zh' ? '历史 Basis' : 'Historical basis') : t('Historical price difference')}>
                 {(Object.keys(PAIR_HISTORY_RANGES) as PairHistoryRange[]).map((range) =>
                   <button key={range} className={priceDifferenceRange === range ? 'active' : ''} onClick={() => setPriceDifferenceRange(range)}>{range}</button>)}
               </div>
