@@ -92,7 +92,7 @@ export function CarryResearchPanel(props: CarryResearchPanelProps) {
           setFetchedAt(response.fetchedAt);
           setStatus(response.entries.some((entry) => entry.points.length > 0) ? 'ready' : 'empty');
         })
-        .catch((error) => {
+        .catch(() => {
           if (cancelled || controller?.signal.aborted) return;
           setStatus('error');
         });
@@ -207,8 +207,8 @@ export function CarryResearchPanel(props: CarryResearchPanelProps) {
     <footer className="carry-research-note">
       <span>ⓘ</span>
       <p>{zh
-        ? '可执行 Basis 使用当前 short bid / long ask；历史 Basis 使用已存在的 Kline 收盘价差作为分布参考。两者不是同一种成交口径，因此 Z-score 是研究信号，不是成交保证。'
-        : 'Executable basis uses the current short bid / long ask. Historical basis uses the existing candle-close spread as a distribution proxy. They are different execution conventions, so the z-score is a research signal, not a fill guarantee.'}</p>
+        ? '可执行 Basis 优先使用当前 short bid / long ask；历史 Basis 使用已存在的 Kline 收盘价差作为分布参考。若实时 WS 报价暂不可用，Position 页面可能回退到最近参考价，因此交易前仍应确认实时盘口。Z-score 是研究信号，不是成交保证。'
+        : 'Executable basis prefers the current short bid / long ask. Historical basis uses the existing candle-close spread as a distribution proxy. If the live WS quote is temporarily unavailable, the Position screen may fall back to its latest reference price, so confirm the live book before trading. The z-score is a research signal, not a fill guarantee.'}</p>
     </footer>
   </article>;
 }
