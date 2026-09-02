@@ -1,9 +1,5 @@
 name: ci
-on:
-  push:
-    branches-ignore:
-      - feature/carry-research-observations
-  pull_request:
+on: [push, pull_request]
 permissions:
   contents: read
 concurrency:
