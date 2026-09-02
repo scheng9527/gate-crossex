@@ -1,5 +1,6 @@
 import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
 import type { FundingChartSeries } from './charts.js';
+import { CarryArmedControls } from './carry-armed-controls.js';
 import { buildCarryEconomics, summarizeBasisResearch } from './carry-research.js';
 import {
   loadFundingObservations,
@@ -62,7 +63,6 @@ function trajectoryMetric(
     peak: summary?.localPeakRate === null || summary?.localPeakRate === undefined
       ? null : normalizeRatePercent8h(summary.localPeakRate, intervalHours),
     drawdown: summary?.drawdownFromPeakPct ?? null,
-    // Backend slope is native-rate bps. Scale it to an 8h-equivalent for consistency with current/peak.
     slope: summary?.oneHourSlopeBps === null || summary?.oneHourSlopeBps === undefined || intervalHours === null || intervalHours <= 0
       ? null : summary.oneHourSlopeBps * (8 / intervalHours),
     count: summary?.observationCount ?? 0,
@@ -152,7 +152,7 @@ export function CarryResearchPanel(props: CarryResearchPanelProps) {
       <div>
         <p className="eyebrow">{zh ? 'Carry 研究' : 'Carry research'}</p>
         <h2>{props.asset} · {zh ? 'Funding 形成过程 + Basis + 成本' : 'Funding formation + basis + costs'}</h2>
-        <small>{zh ? '只读研究层；不触发自动开仓' : 'Read-only research layer; no automated entry'}</small>
+        <small>{zh ? '上半部分为只读研究；下方 Armed Entry 必须单独授权' : 'Research above is read-only; Armed Entry below requires separate explicit authorization'}</small>
       </div>
       <div className="carry-range-control" role="group" aria-label={zh ? '观察窗口' : 'Observation window'}>
         {OBSERVATION_RANGES.map((value) => <button key={value} className={hours === value ? 'active' : ''} onClick={() => setHours(value)}>{value}H</button>)}
@@ -210,5 +210,14 @@ export function CarryResearchPanel(props: CarryResearchPanelProps) {
         ? '可执行 Basis 优先使用当前 short bid / long ask；历史 Basis 使用已存在的 Kline 收盘价差作为分布参考。若实时 WS 报价暂不可用，Position 页面可能回退到最近参考价，因此交易前仍应确认实时盘口。Z-score 是研究信号，不是成交保证。'
         : 'Executable basis prefers the current short bid / long ask. Historical basis uses the existing candle-close spread as a distribution proxy. If the live WS quote is temporarily unavailable, the Position screen may fall back to its latest reference price, so confirm the live book before trading. The z-score is a research signal, not a fill guarantee.'}</p>
     </footer>
+
+    <CarryArmedControls
+      language={props.language}
+      asset={props.asset}
+      shortSymbol={props.shortSymbol}
+      longSymbol={props.longSymbol}
+      shortFundingIntervalHours={props.shortFundingIntervalHours}
+      longFundingIntervalHours={props.longFundingIntervalHours}
+    />
   </article>;
 }
