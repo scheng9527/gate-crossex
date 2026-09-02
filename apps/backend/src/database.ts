@@ -130,7 +130,9 @@ export function openDatabase(databasePath: string, migrationsDir: string): Datab
     }
 
     assertDatabaseIntegrity(database);
-    if (migrationFiles.includes('0019_strategy_accounts.sql')) assertCurrentSchema(database);
+    // Keep partial/fixture migration directories valid: the full-schema assertion is only meaningful
+    // when the latest migration that defines CURRENT_SCHEMA_TABLES is actually present.
+    if (migrationFiles.includes('0021_funding_rate_observations.sql')) assertCurrentSchema(database);
     database.pragma('optimize');
     return database;
   } catch (error) {
