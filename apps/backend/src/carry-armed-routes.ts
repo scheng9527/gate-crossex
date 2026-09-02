@@ -94,7 +94,7 @@ export function registerCarryArmedRoutes(
     const account = await activeAccount();
     if (!account) return reply.code(409).send({ error: 'credential_not_configured' });
     try {
-      return service.cancel(parsed.data.id, account.profileId);
+      return await service.cancel(parsed.data.id, account.profileId);
     } catch (error) {
       if (error instanceof TradingRuntimeError) {
         return reply.code(error.statusCode).send({ error: error.code, ...(error.label ? { label: error.label } : {}) });
