@@ -1,4 +1,6 @@
 import { buildApp } from './app.js';
+import { registerCarryArmedRoutes } from './carry-armed-routes.js';
+import { CarryArmedService } from './carry-armed-service.js';
 import { registerCarryResearchRoutes } from './carry-research-routes.js';
 import { loadConfig } from './config.js';
 import { createSystemCredentialVault } from './credential-vault.js';
@@ -10,6 +12,8 @@ import { CrossExMarketHub } from './market-hub.js';
 import { acquireBackendProcessLock } from './process-lock.js';
 import { readHyperliquidPerpMetadata, writeHyperliquidPerpMetadata } from './repositories.js';
 import { monitorWindowsServiceParent } from './service-parent-monitor.js';
+import { TradingRuntimeError, type StrategyRecord } from './trading-runtime.js';
+import { TradingSession } from './trading-session.js';
 
 process.umask(0o077);
 const config = loadConfig();
@@ -23,6 +27,7 @@ try {
 }
 
 const marketHub = new CrossExMarketHub(config.gatePublicWebSocketUrl);
+const tradingSession = new TradingSession();
 const fundingObservations = new FundingObservationStore(database);
 // Capture deterministic boot placeholders before any public socket event can turn a market live.
 // The store will not persist a symbol until a later funding-channel change proves the seed was
@@ -34,6 +39,7 @@ const unsubscribeFundingObservations = marketHub.subscribe((message) => {
 });
 
 let app: Awaited<ReturnType<typeof buildApp>>;
+let carryArmed: CarryArmedService | null = null;
 try {
   const credentialVault = await createSystemCredentialVault(config.credentialEnvPath, {
     disableKeychain: process.env.GCT_DISABLE_OS_KEYCHAIN === '1',
@@ -50,11 +56,66 @@ try {
       },
     }),
     marketHub,
+    tradingSession,
     startMarketStream: true,
   });
   registerCarryResearchRoutes(app, fundingObservations);
+
+  // Use Fastify's in-process request path instead of bypassing the established execution route.
+  // A triggered carry entry therefore still crosses the exact /api/strategies credential,
+  // instrument, margin, leverage and StrategyEngine preflights used by a manual launch.
+  const internalHost = [...config.allowedHosts][0] ?? '127.0.0.1';
+  const activeAccount = async (): Promise<{ profileId: string; label: string } | null> => {
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/onboarding/connection',
+      headers: { host: internalHost },
+    });
+    if (response.statusCode < 200 || response.statusCode >= 300) return null;
+    const payload = response.json() as {
+      activeProfileId?: unknown;
+      label?: unknown;
+      profiles?: Array<{ id?: unknown; label?: unknown; active?: unknown }>;
+    };
+    if (typeof payload.activeProfileId !== 'string') return null;
+    const profile = payload.profiles?.find((item) => item.active === true && item.id === payload.activeProfileId);
+    const label = typeof profile?.label === 'string'
+      ? profile.label
+      : typeof payload.label === 'string' ? payload.label : 'Gate CrossEx';
+    return { profileId: payload.activeProfileId, label };
+  };
+  const startStrategy = async (strategy: Parameters<CarryArmedService['arm']>[0]['strategy']): Promise<StrategyRecord> => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/strategies',
+      headers: {
+        host: internalHost,
+        'x-gct-trading-intent': 'start-strategy',
+        'content-type': 'application/json',
+      },
+      payload: strategy as object,
+    });
+    const payload = response.json() as Record<string, unknown>;
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      const code = typeof payload.error === 'string' ? payload.error : 'strategy_start_failed';
+      const label = typeof payload.label === 'string' ? payload.label : undefined;
+      throw new TradingRuntimeError(code, response.statusCode, label);
+    }
+    return payload as unknown as StrategyRecord;
+  };
+
+  carryArmed = new CarryArmedService(database, {
+    market: (symbol) => marketHub.market(symbol),
+    connectionState: () => marketHub.connectionState(),
+    liveTradingEnabled: () => tradingSession.liveTradingEnabled,
+    activeCredentialProfile: activeAccount,
+    startStrategy,
+  });
+  registerCarryArmedRoutes(app, carryArmed, activeAccount);
 } catch (error) {
+  await carryArmed?.stop().catch(() => undefined);
   unsubscribeFundingObservations();
+  marketHub.stop();
   database.close();
   processLock.release();
   throw error;
@@ -66,6 +127,8 @@ async function shutdown(signal: string): Promise<void> {
   closing = true;
   app.log.info({ signal }, 'shutting down local backend');
   try {
+    // Stop future carry claims before app.close() begins cancelling/quiescing live orders.
+    await carryArmed?.stop();
     await app.close();
     unsubscribeFundingObservations();
     prepareDatabaseForClose(database);
@@ -104,8 +167,10 @@ process.on('uncaughtException', (error) => emergencyExit('uncaughtException', er
 
 try {
   await app.listen({ host: config.host, port: config.port });
+  carryArmed?.start();
 } catch (error) {
   app.log.error(error, 'failed to start local backend');
+  await carryArmed?.stop().catch(() => undefined);
   await app.close().catch((closeError) => app.log.error(closeError, 'startup cleanup failed'));
   unsubscribeFundingObservations();
   prepareDatabaseForClose(database);
