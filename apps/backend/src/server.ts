@@ -1,4 +1,5 @@
 import { buildApp } from './app.js';
+import { registerCarryResearchRoutes } from './carry-research-routes.js';
 import { loadConfig } from './config.js';
 import { createSystemCredentialVault } from './credential-vault.js';
 import { GateCrossExClient } from './crossex-client.js';
@@ -23,6 +24,10 @@ try {
 
 const marketHub = new CrossExMarketHub(config.gatePublicWebSocketUrl);
 const fundingObservations = new FundingObservationStore(database);
+// Capture deterministic boot placeholders before any public socket event can turn a market live.
+// The store will not persist a symbol until a later funding-channel change proves the seed was
+// replaced by real data.
+fundingObservations.primeMarkets(marketHub.snapshot().markets);
 const unsubscribeFundingObservations = marketHub.subscribe((message) => {
   if (message.type !== 'market.update') return;
   fundingObservations.observeMarket(message.payload);
@@ -47,6 +52,7 @@ try {
     marketHub,
     startMarketStream: true,
   });
+  registerCarryResearchRoutes(app, fundingObservations);
 } catch (error) {
   unsubscribeFundingObservations();
   database.close();
