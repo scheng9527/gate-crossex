@@ -1,6 +1,6 @@
 CREATE TABLE IF NOT EXISTS carry_armed_entries (
   id TEXT PRIMARY KEY,
-  status TEXT NOT NULL CHECK (status IN ('ARMED', 'TRIGGERING', 'TRIGGERED', 'CANCELLED', 'ERROR')),
+  status TEXT NOT NULL CHECK (status IN ('ARMED', 'TRIGGERING', 'TRIGGERED', 'COMPLETED', 'CANCELLED', 'ERROR')),
   asset TEXT NOT NULL,
   short_symbol TEXT NOT NULL,
   long_symbol TEXT NOT NULL,
