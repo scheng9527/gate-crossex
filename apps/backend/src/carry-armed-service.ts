@@ -72,6 +72,7 @@ export interface CarryArmedServiceOptions {
 }
 
 const TERMINAL_STATUSES: CarryArmedStatus[] = ['TRIGGERED', 'CANCELLED', 'ERROR'];
+const ACTIVE_EXECUTION_STATUSES = ['RUNNING', 'PAUSED', 'PAUSE_PENDING_REMOTE', 'STOP_PENDING_REMOTE'] as const;
 const TRANSIENT_START_ERRORS = new Set([
   'live_trading_locked',
   'strategy_market_data_unavailable',
@@ -198,15 +199,35 @@ export class CarryArmedService {
       throw new TradingRuntimeError('carry_arm_symbol_direction_mismatch', 400);
     }
     if (!input.gate.enabled) throw new TradingRuntimeError('carry_gate_disabled', 400);
-    const countRow = this.database.prepare(`SELECT COUNT(*) AS count FROM carry_armed_entries WHERE status IN ('ARMED', 'TRIGGERING', 'TRIGGERED')`)
-      .get() as { count: number };
-    if (countRow.count >= 20) throw new TradingRuntimeError('too_many_armed_carry_entries', 409);
+
+    const activeStatusPlaceholders = ACTIVE_EXECUTION_STATUSES.map(() => '?').join(', ');
+    const activeCount = this.database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM carry_armed_entries AS armed
+      LEFT JOIN execution_strategies AS strategy ON strategy.id = armed.triggered_strategy_id
+      WHERE armed.status IN ('ARMED', 'TRIGGERING')
+         OR (armed.status = 'TRIGGERED' AND strategy.status IN (${activeStatusPlaceholders}))
+    `).get(...ACTIVE_EXECUTION_STATUSES) as { count: number };
+    if (activeCount.count >= 20) throw new TradingRuntimeError('too_many_armed_carry_entries', 409);
+
     const duplicate = this.database.prepare(`
-      SELECT id FROM carry_armed_entries
-      WHERE status IN ('ARMED', 'TRIGGERING', 'TRIGGERED')
-        AND credential_profile_id = ? AND short_symbol = ? AND long_symbol = ?
+      SELECT armed.id
+      FROM carry_armed_entries AS armed
+      LEFT JOIN execution_strategies AS strategy ON strategy.id = armed.triggered_strategy_id
+      WHERE armed.credential_profile_id = ?
+        AND armed.short_symbol = ?
+        AND armed.long_symbol = ?
+        AND (
+          armed.status IN ('ARMED', 'TRIGGERING')
+          OR (armed.status = 'TRIGGERED' AND strategy.status IN (${activeStatusPlaceholders}))
+        )
       LIMIT 1
-    `).get(input.account.profileId, input.shortSymbol, input.longSymbol) as { id: string } | undefined;
+    `).get(
+      input.account.profileId,
+      input.shortSymbol,
+      input.longSymbol,
+      ...ACTIVE_EXECUTION_STATUSES,
+    ) as { id: string } | undefined;
     if (duplicate) throw new TradingRuntimeError('carry_entry_already_armed', 409, duplicate.id);
 
     const id = `CARRY-${randomUUID().replaceAll('-', '').slice(0, 10).toUpperCase()}`;
