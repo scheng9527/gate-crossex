@@ -17,6 +17,7 @@ interface AppliedMigration {
 const CURRENT_SCHEMA_TABLES = [
   'audit_events',
   'candle_cache',
+  'carry_armed_entries',
   'crossex_instruments',
   'credential_session',
   'execution_fills',
@@ -132,7 +133,7 @@ export function openDatabase(databasePath: string, migrationsDir: string): Datab
     assertDatabaseIntegrity(database);
     // Keep partial/fixture migration directories valid: the full-schema assertion is only meaningful
     // when the latest migration that defines CURRENT_SCHEMA_TABLES is actually present.
-    if (migrationFiles.includes('0021_funding_rate_observations.sql')) assertCurrentSchema(database);
+    if (migrationFiles.includes('0022_carry_armed_entries.sql')) assertCurrentSchema(database);
     database.pragma('optimize');
     return database;
   } catch (error) {
