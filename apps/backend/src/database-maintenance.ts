@@ -3,6 +3,7 @@ import type Database from 'better-sqlite3';
 const DAY_MS = 24 * 60 * 60_000;
 const AUDIT_RETENTION_MS = 180 * DAY_MS;
 const EXECUTION_RETENTION_MS = 365 * DAY_MS;
+const FUNDING_OBSERVATION_RETENTION_MS = 90 * DAY_MS;
 const MAX_AUDIT_EVENTS = 50_000;
 
 export interface DatabaseMaintenanceResult {
@@ -10,12 +11,14 @@ export interface DatabaseMaintenanceResult {
   strategyLogsDeleted: number;
   fillsDeleted: number;
   ordersDeleted: number;
+  fundingObservationsDeleted: number;
 }
 
 /**
- * Bound locally generated operational data while preserving active strategy state. Execution
- * history is retained for a year; rows belonging to running, paused, or unresolved strategies
- * are never selected for pruning.
+ * Bound locally generated operational and research data while preserving active strategy state.
+ * Execution history is retained for a year; funding-formation samples are retained for 90 days,
+ * which is materially longer than the 72-hour interactive research window while keeping a busy
+ * multi-venue scanner from growing SQLite indefinitely.
  */
 export function runDatabaseMaintenance(
   database: Database.Database,
@@ -23,6 +26,7 @@ export function runDatabaseMaintenance(
 ): DatabaseMaintenanceResult {
   const auditCutoff = new Date(now - AUDIT_RETENTION_MS).toISOString();
   const executionCutoff = new Date(now - EXECUTION_RETENTION_MS).toISOString();
+  const fundingObservationCutoff = new Date(now - FUNDING_OBSERVATION_RETENTION_MS).toISOString();
   return database.transaction(() => {
     const expiredAudit = database.prepare('DELETE FROM audit_events WHERE created_at < ?').run(auditCutoff).changes;
     const excessAudit = database.prepare(`
@@ -60,11 +64,15 @@ export function runDatabaseMaintenance(
     const ordersDeleted = database.prepare(`
       DELETE FROM execution_orders WHERE ${eligibleOrderFilter}
     `).run(executionCutoff).changes;
+    const fundingObservationsDeleted = database.prepare(`
+      DELETE FROM funding_rate_observations WHERE observed_at < ?
+    `).run(fundingObservationCutoff).changes;
     return {
       auditEventsDeleted: expiredAudit + excessAudit,
       strategyLogsDeleted,
       fillsDeleted,
       ordersDeleted,
+      fundingObservationsDeleted,
     };
   })();
 }
