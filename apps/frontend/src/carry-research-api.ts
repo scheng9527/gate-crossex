@@ -70,7 +70,7 @@ function trajectorySummary(value: unknown): FundingTrajectorySummary | null {
   };
 }
 
-function parseFundingObservationResponse(value: unknown): FundingObservationResponse | null {
+export function parseFundingObservationResponse(value: unknown): FundingObservationResponse | null {
   if (!value || typeof value !== 'object') return null;
   const record = value as Record<string, unknown>;
   if (record.source !== 'local_crossex_funding_observations'
@@ -104,20 +104,28 @@ export async function loadFundingObservations(
   durationHours: number,
   signal?: AbortSignal,
 ): Promise<FundingObservationResponse> {
-  const timeout = AbortSignal.timeout(15_000);
-  const combinedSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
-  const response = await fetch('/api/markets/funding-observations', {
-    method: 'POST',
-    headers: {
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-      'x-gct-read-intent': 'funding-observations',
-    },
-    body: JSON.stringify({ symbols, durationHours }),
-    signal: combinedSignal,
-  });
-  if (!response.ok) throw new Error(`funding_observations_${response.status}`);
-  const parsed = parseFundingObservationResponse(await response.json());
-  if (!parsed) throw new Error('invalid_funding_observation_response');
-  return parsed;
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 15_000);
+  const forwardAbort = () => controller.abort();
+  signal?.addEventListener('abort', forwardAbort, { once: true });
+  if (signal?.aborted) controller.abort();
+  try {
+    const response = await fetch('/api/markets/funding-observations', {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        'x-gct-read-intent': 'funding-observations',
+      },
+      body: JSON.stringify({ symbols, durationHours }),
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`funding_observations_${response.status}`);
+    const parsed = parseFundingObservationResponse(await response.json());
+    if (!parsed) throw new Error('invalid_funding_observation_response');
+    return parsed;
+  } finally {
+    window.clearTimeout(timeout);
+    signal?.removeEventListener('abort', forwardAbort);
+  }
 }
