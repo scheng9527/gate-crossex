@@ -12,6 +12,7 @@ export interface FundingObservation {
 export interface FundingObservationStoreOptions {
   minIntervalMs?: number;
   minRateDeltaBps?: number;
+  now?: () => number;
 }
 
 interface LastPersistedObservation {
@@ -19,13 +20,33 @@ interface LastPersistedObservation {
   fundingRate: number;
 }
 
+interface LastSeenFunding {
+  fundingRate: number;
+  nextFundingAt: string;
+}
+
 const DEFAULT_MIN_INTERVAL_MS = 30_000;
 const DEFAULT_MIN_RATE_DELTA_BPS = 0.5;
 
+/**
+ * Persist the funding-rate formation process from the existing CrossEx market stream.
+ *
+ * `LiveMarket.updatedAt` belongs to the ticker frame and intentionally does not advance on
+ * funding/OI pushes because the strategy engine uses it as executable-price freshness evidence.
+ * This store therefore timestamps observations with backend wall-clock time instead.
+ *
+ * The market hub is born with deterministic seed funding values. Call `primeMarkets()` before the
+ * stream starts; a symbol is not eligible for persistence until a later market update changes its
+ * funding rate or next-funding timestamp. That proves a real funding-channel frame has replaced
+ * the seed. Once confirmed, intervening ticker updates can provide the requested periodic sample.
+ */
 export class FundingObservationStore {
   private readonly lastPersisted = new Map<string, LastPersistedObservation>();
+  private readonly lastSeenFunding = new Map<string, LastSeenFunding>();
+  private readonly confirmedFundingSymbols = new Set<string>();
   private readonly minIntervalMs: number;
   private readonly minRateDeltaBps: number;
+  private readonly now: () => number;
   private readonly insertStatement: Database.Statement;
 
   constructor(
@@ -34,6 +55,7 @@ export class FundingObservationStore {
   ) {
     this.minIntervalMs = options.minIntervalMs ?? DEFAULT_MIN_INTERVAL_MS;
     this.minRateDeltaBps = options.minRateDeltaBps ?? DEFAULT_MIN_RATE_DELTA_BPS;
+    this.now = options.now ?? Date.now;
     this.insertStatement = database.prepare(`
       INSERT INTO funding_rate_observations (
         symbol, observed_at, funding_rate, next_funding_at, source
@@ -41,13 +63,39 @@ export class FundingObservationStore {
     `);
   }
 
+  /** Capture the hub's boot-time funding placeholders so they can never become research data. */
+  primeMarkets(markets: readonly LiveMarket[]): void {
+    for (const market of markets) {
+      const rate = Number(market.fundingRate);
+      if (!Number.isFinite(rate)) continue;
+      this.lastSeenFunding.set(market.symbol, {
+        fundingRate: rate,
+        nextFundingAt: market.nextFundingAt,
+      });
+    }
+  }
+
   observeMarket(market: LiveMarket): boolean {
-    if (market.source !== 'gate_crossex_websocket') return false;
-
     const rate = Number(market.fundingRate);
-    const observedAtMs = Date.parse(market.updatedAt);
-    if (!Number.isFinite(rate) || !Number.isFinite(observedAtMs)) return false;
+    if (!Number.isFinite(rate)) return false;
 
+    const previousSeen = this.lastSeenFunding.get(market.symbol);
+    const fundingChanged = previousSeen !== undefined && (
+      previousSeen.fundingRate !== rate || previousSeen.nextFundingAt !== market.nextFundingAt
+    );
+    this.lastSeenFunding.set(market.symbol, {
+      fundingRate: rate,
+      nextFundingAt: market.nextFundingAt,
+    });
+    if (fundingChanged) this.confirmedFundingSymbols.add(market.symbol);
+
+    // A ticker can become live before the first funding push. Do not persist its inherited seed.
+    if (market.source !== 'gate_crossex_websocket' || !this.confirmedFundingSymbols.has(market.symbol)) {
+      return false;
+    }
+
+    const observedAtMs = this.now();
+    if (!Number.isFinite(observedAtMs) || observedAtMs <= 0) return false;
     const previous = this.lastPersisted.get(market.symbol);
     if (previous) {
       const elapsedMs = observedAtMs - previous.observedAtMs;
@@ -55,9 +103,10 @@ export class FundingObservationStore {
       if (elapsedMs < this.minIntervalMs && deltaBps < this.minRateDeltaBps) return false;
     }
 
+    const observedAt = new Date(observedAtMs).toISOString();
     this.insertStatement.run(
       market.symbol,
-      market.updatedAt,
+      observedAt,
       market.fundingRate,
       market.nextFundingAt,
       market.source,
