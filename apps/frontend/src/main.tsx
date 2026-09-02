@@ -2,6 +2,7 @@ import React, { Component, type ErrorInfo, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App.js';
 import './styles.css';
+import './carry-research.css';
 
 interface ErrorBoundaryState {
   failed: boolean;
