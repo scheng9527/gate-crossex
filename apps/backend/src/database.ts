@@ -25,6 +25,7 @@ const CURRENT_SCHEMA_TABLES = [
   'execution_strategy_logs',
   'funding_history_coverage',
   'funding_rate_history',
+  'funding_rate_observations',
   'hyperliquid_perp_metadata',
   'schema_migrations',
 ] as const;
