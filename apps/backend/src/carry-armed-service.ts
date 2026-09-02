@@ -5,7 +5,6 @@ import { nativeMarketAsset } from './market-asset-aliases.js';
 import type { LiveMarket } from './market-hub.js';
 import { CreateStrategyInputSchema, type CreateStrategyInput, type StrategyRecord, TradingRuntimeError } from './trading-runtime.js';
 import {
-  carryGateDecisionText,
   evaluateCarryEntryGate,
   type CarryEntryGateConfig,
   type CarryEntryGateMetrics,
@@ -57,8 +56,8 @@ export interface CarryArmedServiceOptions {
   market(symbol: string): LiveMarket | null;
   connectionState?(): 'connecting' | 'healthy' | 'reconnecting' | 'stale' | 'disconnected';
   liveTradingEnabled(): boolean;
-  activeCredentialProfile(): { profileId: string; label: string } | null;
-  startStrategy(strategy: CreateStrategyInput, account: { profileId: string; label: string }): Promise<StrategyRecord>;
+  activeCredentialProfile(): Promise<{ profileId: string; label: string } | null>;
+  startStrategy(strategy: CreateStrategyInput): Promise<StrategyRecord>;
   tickIntervalMs?: number;
   marketFreshnessMs?: number;
   now?: () => number;
@@ -70,6 +69,7 @@ const TRANSIENT_START_ERRORS = new Set([
   'strategy_market_data_unavailable',
   'too_many_running_strategies',
   'credential_mutation_in_progress',
+  'strategy_instrument_constraints_unavailable',
 ]);
 
 function symbolFor(venue: string, asset: string): string {
@@ -77,7 +77,7 @@ function symbolFor(venue: string, asset: string): string {
   return `${venue}_FUTURE_${nativeMarketAsset(venue, 'FUTURE', asset)}_${quote}`;
 }
 
-function safeJsonObject(value: string | null): CarryEntryGateMetrics | null {
+function safeMetrics(value: string | null): CarryEntryGateMetrics | null {
   if (!value) return null;
   try {
     const parsed: unknown = JSON.parse(value);
@@ -88,8 +88,6 @@ function safeJsonObject(value: string | null): CarryEntryGateMetrics | null {
 }
 
 function rowToEntry(row: CarryArmedRow): CarryArmedEntry {
-  const strategy = CreateStrategyInputSchema.parse(JSON.parse(row.strategy_json));
-  const gate = JSON.parse(row.gate_json) as CarryEntryGateConfig;
   return {
     id: row.id,
     status: row.status,
@@ -98,10 +96,10 @@ function rowToEntry(row: CarryArmedRow): CarryArmedEntry {
     longSymbol: row.long_symbol,
     credentialProfileId: row.credential_profile_id,
     credentialProfileLabel: row.credential_profile_label,
-    strategy,
-    gate,
+    strategy: CreateStrategyInputSchema.parse(JSON.parse(row.strategy_json)),
+    gate: JSON.parse(row.gate_json) as CarryEntryGateConfig,
     lastGateReason: row.last_gate_reason,
-    lastGateMetrics: safeJsonObject(row.last_gate_metrics_json),
+    lastGateMetrics: safeMetrics(row.last_gate_metrics_json),
     triggeredStrategyId: row.triggered_strategy_id,
     errorReason: row.error_reason,
     createdAt: row.created_at,
@@ -114,10 +112,10 @@ function rowToEntry(row: CarryArmedRow): CarryArmedEntry {
 /**
  * Persistent user-authorized carry entry watch.
  *
- * ARMED is intentionally separate from execution_strategies. Only after every carry condition is
- * satisfied does this service call the existing StrategyEngine start boundary. That keeps order
- * placement, two-leg hedging, partial-fill repair, leverage/risk checks and shutdown quiescence in
- * the already-audited execution path instead of duplicating them here.
+ * ARMED is separate from execution_strategies. Only after every carry condition passes does this
+ * service cross the application's existing strategy-start boundary. Two-leg execution, partial
+ * fill repair, margin/leverage checks, credential serialization and shutdown quiescence therefore
+ * remain owned by the existing execution stack.
  */
 export class CarryArmedService {
   private readonly tickIntervalMs: number;
@@ -135,8 +133,8 @@ export class CarryArmedService {
     this.tickIntervalMs = options.tickIntervalMs ?? 1_000;
     this.marketFreshnessMs = options.marketFreshnessMs ?? 15_000;
     this.now = options.now ?? Date.now;
-    // A crash during the tiny TRIGGERING window is deliberately fail-closed. The linked strategy
-    // may or may not have been created, so automatic retry could duplicate exposure.
+    // A crash during TRIGGERING is ambiguous: the execution strategy might already exist. Never
+    // auto-retry that state on restart because doing so could duplicate live exposure.
     const now = new Date(this.now()).toISOString();
     database.prepare(`
       UPDATE carry_armed_entries
@@ -191,10 +189,9 @@ export class CarryArmedService {
       throw new TradingRuntimeError('carry_arm_symbol_direction_mismatch', 400);
     }
     if (!input.gate.enabled) throw new TradingRuntimeError('carry_gate_disabled', 400);
-    if (this.database.prepare(`SELECT COUNT(*) AS count FROM carry_armed_entries WHERE status = 'ARMED'`)
-      .get() as { count: number }.count >= 20) {
-      throw new TradingRuntimeError('too_many_armed_carry_entries', 409);
-    }
+    const countRow = this.database.prepare(`SELECT COUNT(*) AS count FROM carry_armed_entries WHERE status = 'ARMED'`)
+      .get() as { count: number };
+    if (countRow.count >= 20) throw new TradingRuntimeError('too_many_armed_carry_entries', 409);
     const duplicate = this.database.prepare(`
       SELECT id FROM carry_armed_entries
       WHERE status IN ('ARMED', 'TRIGGERING')
@@ -262,13 +259,10 @@ export class CarryArmedService {
       const entry = rowToEntry(row);
       try {
         await this.evaluate(entry);
-      } catch (error) {
+      } catch {
         this.recordDecision(entry.id, 'carry_gate_internal_error', null, true);
-        if (error instanceof Error) {
-          // Do not convert a transient evaluator bug into repeated live order attempts. The entry
-          // remains armed but cannot trigger until a later clean pass succeeds.
-          this.retryAfter.set(entry.id, this.now() + 30_000);
-        }
+        // A bad evaluator/API state must not turn into a tight loop against the live execution edge.
+        this.retryAfter.set(entry.id, this.now() + 30_000);
       }
     }
   }
@@ -293,7 +287,7 @@ export class CarryArmedService {
       this.recordDecision(entry.id, 'live_trading_locked', null);
       return;
     }
-    const activeAccount = this.options.activeCredentialProfile();
+    const activeAccount = await this.options.activeCredentialProfile();
     if (!activeAccount || activeAccount.profileId !== entry.credentialProfileId) {
       this.recordDecision(entry.id, 'account_not_active', null);
       return;
@@ -313,22 +307,7 @@ export class CarryArmedService {
     const basisBps = shortBid.minus(longAsk).div(longAsk).mul(10_000).toNumber();
     const entryThreshold = Number(entry.strategy.entryBps ?? '0');
     if (!Number.isFinite(entryThreshold) || basisBps < entryThreshold) {
-      this.recordDecision(entry.id, 'basis_below_entry_threshold', {
-        fundingEdgeBps8h: null,
-        executableBasisBps: basisBps,
-        roundTripFeeBps: null,
-        carryCushionBps8hProxy: null,
-        shortFundingState: 'INSUFFICIENT',
-        longFundingState: 'INSUFFICIENT',
-        shortObservationCount: 0,
-        longObservationCount: 0,
-        shortObservationAgeSeconds: null,
-        longObservationAgeSeconds: null,
-        shortOpenInterestUsd: Number(shortMarket.openInterestValue) || null,
-        longOpenInterestUsd: Number(longMarket.openInterestValue) || null,
-        shortSecondsToFunding: null,
-        longSecondsToFunding: null,
-      });
+      this.recordDecision(entry.id, 'basis_below_entry_threshold', null);
       return;
     }
 
@@ -352,7 +331,18 @@ export class CarryArmedService {
     if (claimed.changes !== 1) return;
 
     try {
-      const strategy = await this.options.startStrategy(entry.strategy, activeAccount);
+      // Re-read the account after the atomic claim. A credential switch between the gate decision
+      // and the strategy-start boundary must not move this authorization to a different account.
+      const stillActive = await this.options.activeCredentialProfile();
+      if (!stillActive || stillActive.profileId !== entry.credentialProfileId) {
+        const now = new Date(this.now()).toISOString();
+        this.database.prepare(`
+          UPDATE carry_armed_entries SET status = 'ARMED', last_gate_reason = 'account_not_active', updated_at = ?
+          WHERE id = ? AND status = 'TRIGGERING'
+        `).run(now, entry.id);
+        return;
+      }
+      const strategy = await this.options.startStrategy(entry.strategy);
       const triggeredAt = new Date(this.now()).toISOString();
       this.database.prepare(`
         UPDATE carry_armed_entries
@@ -386,12 +376,13 @@ export class CarryArmedService {
     metrics: CarryEntryGateMetrics | null,
     force = false,
   ): void {
-    const current = this.database.prepare(`SELECT last_gate_reason FROM carry_armed_entries WHERE id = ? AND status = 'ARMED'`)
-      .get(id) as { last_gate_reason: string | null } | undefined;
+    const current = this.database.prepare(`
+      SELECT last_gate_reason FROM carry_armed_entries WHERE id = ? AND status = 'ARMED'
+    `).get(id) as { last_gate_reason: string | null } | undefined;
     if (!current) return;
     const nowMs = this.now();
     const lastWriteAt = this.lastDecisionWriteAt.get(id) ?? 0;
-    // Persist immediately when the state changes; otherwise heartbeat at most every 30 seconds.
+    // State changes are durable immediately. A stable waiting state writes at most every 30s.
     if (!force && current.last_gate_reason === reason && nowMs - lastWriteAt < 30_000) return;
     const now = new Date(nowMs).toISOString();
     this.database.prepare(`
@@ -400,14 +391,5 @@ export class CarryArmedService {
       WHERE id = ? AND status = 'ARMED'
     `).run(reason, metrics ? JSON.stringify(metrics) : null, now, id);
     this.lastDecisionWriteAt.set(id, nowMs);
-  }
-
-  decisionDescription(entry: CarryArmedEntry): string {
-    if (!entry.lastGateMetrics) return entry.lastGateReason ?? 'waiting';
-    return carryGateDecisionText({
-      passed: entry.lastGateReason === 'passed',
-      reason: entry.lastGateReason === 'passed' ? 'passed' : 'invalid_config',
-      metrics: entry.lastGateMetrics,
-    });
   }
 }
