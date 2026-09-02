@@ -10,7 +10,7 @@ import {
   type CarryEntryGateMetrics,
 } from './carry-entry-gate.js';
 
-export type CarryArmedStatus = 'ARMED' | 'TRIGGERING' | 'TRIGGERED' | 'CANCELLED' | 'ERROR';
+export type CarryArmedStatus = 'ARMED' | 'TRIGGERING' | 'TRIGGERED' | 'COMPLETED' | 'CANCELLED' | 'ERROR';
 
 export interface CarryArmedEntry {
   id: string;
@@ -71,8 +71,7 @@ export interface CarryArmedServiceOptions {
   now?: () => number;
 }
 
-const TERMINAL_STATUSES: CarryArmedStatus[] = ['TRIGGERED', 'CANCELLED', 'ERROR'];
-const ACTIVE_EXECUTION_STATUSES = ['RUNNING', 'PAUSED', 'PAUSE_PENDING_REMOTE', 'STOP_PENDING_REMOTE'] as const;
+const TERMINAL_STATUSES: CarryArmedStatus[] = ['COMPLETED', 'CANCELLED', 'ERROR'];
 const TRANSIENT_START_ERRORS = new Set([
   'live_trading_locked',
   'strategy_market_data_unavailable',
@@ -168,8 +167,14 @@ export class CarryArmedService {
   list(): CarryArmedEntry[] {
     return (this.database.prepare(`
       SELECT * FROM carry_armed_entries
-      ORDER BY CASE status WHEN 'ARMED' THEN 0 WHEN 'TRIGGERING' THEN 1 WHEN 'TRIGGERED' THEN 2 ELSE 3 END,
-               updated_at DESC
+      ORDER BY CASE status
+        WHEN 'ARMED' THEN 0
+        WHEN 'TRIGGERING' THEN 1
+        WHEN 'TRIGGERED' THEN 2
+        WHEN 'ERROR' THEN 3
+        WHEN 'COMPLETED' THEN 4
+        ELSE 5 END,
+        updated_at DESC
       LIMIT 200
     `).all() as CarryArmedRow[]).map(rowToEntry);
   }
@@ -200,34 +205,18 @@ export class CarryArmedService {
     }
     if (!input.gate.enabled) throw new TradingRuntimeError('carry_gate_disabled', 400);
 
-    const activeStatusPlaceholders = ACTIVE_EXECUTION_STATUSES.map(() => '?').join(', ');
     const activeCount = this.database.prepare(`
-      SELECT COUNT(*) AS count
-      FROM carry_armed_entries AS armed
-      LEFT JOIN execution_strategies AS strategy ON strategy.id = armed.triggered_strategy_id
-      WHERE armed.status IN ('ARMED', 'TRIGGERING')
-         OR (armed.status = 'TRIGGERED' AND strategy.status IN (${activeStatusPlaceholders}))
-    `).get(...ACTIVE_EXECUTION_STATUSES) as { count: number };
+      SELECT COUNT(*) AS count FROM carry_armed_entries
+      WHERE status IN ('ARMED', 'TRIGGERING', 'TRIGGERED')
+    `).get() as { count: number };
     if (activeCount.count >= 20) throw new TradingRuntimeError('too_many_armed_carry_entries', 409);
 
     const duplicate = this.database.prepare(`
-      SELECT armed.id
-      FROM carry_armed_entries AS armed
-      LEFT JOIN execution_strategies AS strategy ON strategy.id = armed.triggered_strategy_id
-      WHERE armed.credential_profile_id = ?
-        AND armed.short_symbol = ?
-        AND armed.long_symbol = ?
-        AND (
-          armed.status IN ('ARMED', 'TRIGGERING')
-          OR (armed.status = 'TRIGGERED' AND strategy.status IN (${activeStatusPlaceholders}))
-        )
+      SELECT id FROM carry_armed_entries
+      WHERE credential_profile_id = ? AND short_symbol = ? AND long_symbol = ?
+        AND status IN ('ARMED', 'TRIGGERING', 'TRIGGERED')
       LIMIT 1
-    `).get(
-      input.account.profileId,
-      input.shortSymbol,
-      input.longSymbol,
-      ...ACTIVE_EXECUTION_STATUSES,
-    ) as { id: string } | undefined;
+    `).get(input.account.profileId, input.shortSymbol, input.longSymbol) as { id: string } | undefined;
     if (duplicate) throw new TradingRuntimeError('carry_entry_already_armed', 409, duplicate.id);
 
     const id = `CARRY-${randomUUID().replaceAll('-', '').slice(0, 10).toUpperCase()}`;
@@ -254,7 +243,7 @@ export class CarryArmedService {
     return this.get(id)!;
   }
 
-  cancel(id: string, accountProfileId: string): CarryArmedEntry {
+  async cancel(id: string, accountProfileId: string): Promise<CarryArmedEntry> {
     const entry = this.get(id);
     if (!entry) throw new TradingRuntimeError('carry_armed_entry_not_found', 404);
     if (entry.credentialProfileId !== accountProfileId) {
@@ -262,11 +251,20 @@ export class CarryArmedService {
     }
     if (entry.status === 'TRIGGERING') throw new TradingRuntimeError('carry_armed_entry_triggering', 409);
     if (TERMINAL_STATUSES.includes(entry.status)) return entry;
+
+    if (entry.status === 'TRIGGERED') {
+      if (!entry.triggeredStrategyId) throw new TradingRuntimeError('triggered_strategy_missing', 409);
+      // Stop further entry through the existing execution engine. This intentionally does not
+      // flatten already matched exposure; any existing position remains visible for manual review.
+      await this.options.stopStrategy(entry.triggeredStrategyId);
+    }
+
     const now = new Date(this.now()).toISOString();
     this.database.prepare(`
       UPDATE carry_armed_entries
-      SET status = 'CANCELLED', cancelled_at = ?, updated_at = ?
-      WHERE id = ? AND status = 'ARMED'
+      SET status = 'CANCELLED', cancelled_at = ?, updated_at = ?,
+          last_gate_reason = 'manual_cancelled'
+      WHERE id = ? AND status IN ('ARMED', 'TRIGGERED')
     `).run(now, now, id);
     this.retryAfter.delete(id);
     return this.get(id)!;
@@ -407,7 +405,15 @@ export class CarryArmedService {
       this.markError(entry.id, 'triggered_strategy_missing');
       return;
     }
-    if (strategy.status === 'COMPLETED') return;
+    if (strategy.status === 'COMPLETED') {
+      const now = new Date(this.now()).toISOString();
+      this.database.prepare(`
+        UPDATE carry_armed_entries
+        SET status = 'COMPLETED', last_gate_reason = 'execution_completed', updated_at = ?
+        WHERE id = ? AND status = 'TRIGGERED'
+      `).run(now, entry.id);
+      return;
+    }
     if (strategy.status === 'STOPPED') {
       const now = new Date(this.now()).toISOString();
       this.database.prepare(`
