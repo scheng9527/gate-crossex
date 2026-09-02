@@ -62,8 +62,8 @@ try {
   registerCarryResearchRoutes(app, fundingObservations);
 
   // Use Fastify's in-process request path instead of bypassing the established execution route.
-  // A triggered carry entry therefore still crosses the exact /api/strategies credential,
-  // instrument, margin, leverage and StrategyEngine preflights used by a manual launch.
+  // A triggered carry entry therefore crosses the same credential, instrument, margin, leverage,
+  // order-reconciliation and StrategyEngine boundaries as a manual /api/strategies launch.
   const internalHost = [...config.allowedHosts][0] ?? '127.0.0.1';
   const activeAccount = async (): Promise<{ profileId: string; label: string } | null> => {
     const response = await app.inject({
@@ -103,6 +103,34 @@ try {
     }
     return payload as unknown as StrategyRecord;
   };
+  const strategyState = async (strategyId: string): Promise<{ status: string; progress: number } | null> => {
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/strategies',
+      headers: { host: internalHost },
+    });
+    if (response.statusCode < 200 || response.statusCode >= 300) return null;
+    const payload = response.json() as { strategies?: unknown };
+    if (!Array.isArray(payload.strategies)) return null;
+    const found = payload.strategies.find((candidate) => {
+      if (!candidate || typeof candidate !== 'object') return false;
+      return (candidate as { id?: unknown }).id === strategyId;
+    }) as { status?: unknown; progress?: unknown } | undefined;
+    if (!found || typeof found.status !== 'string' || typeof found.progress !== 'number' || !Number.isFinite(found.progress)) return null;
+    return { status: found.status, progress: found.progress };
+  };
+  const stopStrategy = async (strategyId: string): Promise<void> => {
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/strategies/${encodeURIComponent(strategyId)}/stop`,
+      headers: { host: internalHost, 'x-gct-trading-intent': 'stop-strategy' },
+    });
+    if (response.statusCode >= 200 && response.statusCode < 300) return;
+    const payload = response.json() as Record<string, unknown>;
+    const code = typeof payload.error === 'string' ? payload.error : 'strategy_stop_failed';
+    const label = typeof payload.label === 'string' ? payload.label : undefined;
+    throw new TradingRuntimeError(code, response.statusCode, label);
+  };
 
   carryArmed = new CarryArmedService(database, {
     market: (symbol) => marketHub.market(symbol),
@@ -110,6 +138,8 @@ try {
     liveTradingEnabled: () => tradingSession.liveTradingEnabled,
     activeCredentialProfile: activeAccount,
     startStrategy,
+    strategyState,
+    stopStrategy,
   });
   registerCarryArmedRoutes(app, carryArmed, activeAccount);
 } catch (error) {
